@@ -138,7 +138,7 @@ def detect_classic_divergence(state: ClassicDivergenceState, closes, highs, lows
     if not math.isnan(state.Classic_bullZoneA_hist_lowest) and h0 >= 0 and not state.Classic_bullZoneB_occurred:
         state.Classic_in_bullZoneB = True
 
-    if state.Classic_in_bullZoneB and h0 <= 0:
+    if state.Classic_in_bullZoneB and h0 < 0:
         state.Classic_bullZoneB_occurred = True
         state.Classic_in_bullZoneB = False
 
