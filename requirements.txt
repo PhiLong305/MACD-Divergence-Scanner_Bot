@@ -4,7 +4,6 @@ aiohttp
 flask
 ctrader-open-api
 twisted
-service_identify
 pandas
 treq
 defaultdict-nicknackgus
