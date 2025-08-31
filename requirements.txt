@@ -1,3 +1,4 @@
+gunicorn #Dùng với Render
 python-dateutil
 aiohttp
 flask
