@@ -199,7 +199,7 @@ def detect_miss_shoulder_divergence(state: MissShoulderDivergenceState, closes, 
 
     if state.MS_in_bearZoneB and h0 > h1:
         state.MS_bearZoneB_occurred = True
-        state.MS_in_bearZoneB = True
+        state.MS_in_bearZoneB = False
 
     bars_since_MS_bearZoneA_hist_highest = (bar_index - state.MS_bearZoneA_bar_highest if not math.isnan(state.MS_bearZoneA_bar_highest) else 0)
 
@@ -241,7 +241,7 @@ def detect_miss_shoulder_divergence(state: MissShoulderDivergenceState, closes, 
 
     if state.MS_in_bullZoneB and h0 < h1:
         state.MS_bullZoneB_occurred = True
-        state.MS_in_bullZoneB = True
+        state.MS_in_bullZoneB = False
 
     bars_since_MS_bullZoneA_hist_lowest = (bar_index - state.MS_bullZoneA_bar_lowest if not math.isnan(state.MS_bullZoneA_bar_lowest) else 0)
 
