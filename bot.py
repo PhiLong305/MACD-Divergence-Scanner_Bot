@@ -1,8 +1,6 @@
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
-from copy import deepcopy
-from typing import Dict, Deque, Any, Tuple
 
 from twisted.internet import reactor, task, defer
 from twisted.internet.defer import inlineCallbacks, DeferredList
@@ -71,18 +69,12 @@ class TelegramBot:
         elif text.startswith("/stop"):
             stop_scanning()
             self.send("🛑 Scanning stopped")
-        elif text.startswith("/test"):
-            parts = text.split(maxsplit=1)
-            if len(parts) == 2:
-                trigger_last_signals(parts[1].strip())
-            else:
-                self.send("⚠️ Missing timeframe. Usage: /test {timeframe}")
         elif text.startswith("/scan"):
             parts = text.split(maxsplit=1)
             if len(parts) == 2:
                 start_scanning(parts[1].strip())
             else:
-                self.send("⚠️ Missing timeframe. Usage: /scan {timeframe}")
+                self.send("⚠️ Missing timeframe. Usage: /scan 5m")
         else:
             self.send(f"Echo: {text}")
     def send_status(self):
@@ -111,8 +103,6 @@ market_data = defaultdict(lambda: {
     "hist": deque(maxlen=MIN_BARS_BACK),
     "state": DivergenceState(),
     "last_ts": 0,
-    "last_tb": None,
-    "pre_last_state": None,
 })
 active_timeframes = set()
 class CTraderClient:
@@ -189,7 +179,7 @@ class CTraderClient:
                 if s.symbolName in PAIRS:
                     self.symbol_ids[s.symbolName] = s.symbolId
             if not self.symbols_loaded_deferred.called:
-                self.symbols_loaded_deferred.callback(None)
+                 self.symbols_loaded_deferred.callback(None)
 
         elif ptype == Protobuf.get_type('ProtoOAGetTrendbarsRes'):
             self.handle_trendbars(payload)
@@ -299,11 +289,7 @@ class CTraderClient:
         tf = self.tf_from_period(payload.period)
         key = (payload.symbolId, payload.period)
         if key in self.history_pending:
-            data = market_data[(symbol, tf)]
-            bars = list(payload.trendbar)
-            for i, tb in enumerate(bars):
-                if i == len(bars) - 1:
-                    data["pre_last_state"] = deepcopy(data["state"])
+            for tb in payload.trendbar:
                 process_trendbar(symbol, tf, tb, live=False)
             self.history_pending.discard(key)
             self.subscribed_trendbars[key] = 0
@@ -317,10 +303,10 @@ class CTraderClient:
                 for tb in payload.trendbar:
                     process_trendbar(symbol, tf, tb, live=True)
 
-def process_trendbar(symbol, tf, tb, live=True, force=False):
+def process_trendbar(symbol, tf, tb, live=True):
     key = (symbol, tf)
     data = market_data[key]
-    if not force and tb.utcTimestampInMinutes <= data["last_ts"]:
+    if tb.utcTimestampInMinutes <= data["last_ts"]:
         return
     scale = 1e5
     low = tb.low / scale
@@ -349,7 +335,6 @@ def process_trendbar(symbol, tf, tb, live=True, force=False):
         for s in signals:
             telegram.send(s)
     data["last_ts"] = tb.utcTimestampInMinutes
-    data["last_tb"] = tb
 
 HELP_TEXT = (
 "🤖 MACD Divergence Detection Bot \n"
@@ -364,7 +349,6 @@ HELP_TEXT = (
 "/stop - Stop scanning\n"
 "/pairs - Danh sách cặp tiền theo dõi\n"
 "/scan [timeframe] - Start scanning\n"
-"/test [timeframe] - Trigger last historical bar as live\n"
 "📊 Scan Commands:\n"
 "Presets:\n/scan 4T - 5m, 15m, 30m, 1h\n/scan 2t - 5m, 15m\n/scan 2T - 30m, 1h\n"
 "Single timeframes:\n/scan 5m, /scan 15m, /scan 30m\n/scan 1h, /scan 4h, /scan 1d\n"
@@ -401,31 +385,6 @@ def start_scanning(tf_text):
         "🎯 Bot sẽ thông báo khi có Divergence Signal!"
     )
 
-def trigger_last_signals(tf_text):
-    tfs = PRESETS.get(tf_text, [tf_text])
-    for tf in tfs:
-        if tf not in TIMEFRAME_MAP:
-            telegram.send(f"❌ Invalid timeframe {tf}")
-            return
-    for tf in tfs:
-        # Lọc các cặp tiền đã có dữ liệu cho timeframe được yêu cầu
-        pairs_with_data = [
-            (pair, data)
-            for (pair, timeframe), data in market_data.items()
-            if timeframe == tf and data.get("last_tb") is not None
-        ]
-
-        if not pairs_with_data:
-            telegram.send(
-                f"⚠️ No cached data for timeframe {tf}. Use /scan {tf} to load data first."
-            )
-            continue
-
-        for pair, data in pairs_with_data:
-            if data.get("pre_last_state") is not None:
-                data["state"] = deepcopy(data["pre_last_state"])
-            process_trendbar(pair, tf, data["last_tb"], live=True, force=True)
-
 def stop_scanning():
     for tf in list(active_timeframes):
         for pair in PAIRS:
@@ -456,7 +415,7 @@ def main_startup_sequence():
 
 if __name__ == '__main__':
     keep_alive()
-    loop.start(1.0) 
+    loop.start(1.0)
     # Chạy chuỗi khởi động chính
     main_startup_sequence()
     # Khởi động reactor để chạy các tác vụ bất đồng bộ
