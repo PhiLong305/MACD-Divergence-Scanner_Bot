@@ -1,7 +1,7 @@
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
-from typing import Dict, Deque, Any, Tuple
+from typing import Dict, Tuple, Set
 
 from twisted.internet import reactor, task, defer
 from twisted.internet.defer import inlineCallbacks, DeferredList
@@ -75,7 +75,7 @@ class TelegramBot:
             if len(parts) == 2:
                 start_scanning(parts[1].strip())
             else:
-                self.send("⚠️ Missing timeframe. Usage: /scan 5m")
+                self.send("⚠️ Missing timeframe. Usage: /scan {timeframe}")
         else:
             self.send(f"Echo: {text}")
     def send_status(self):
@@ -103,6 +103,7 @@ market_data = defaultdict(lambda: {
     "lows": deque(maxlen=MIN_BARS_BACK),
     "hist": deque(maxlen=MIN_BARS_BACK),
     "state": DivergenceState(),
+    "last_ts": 0,
 })
 active_timeframes = set()
 class CTraderClient:
@@ -115,7 +116,10 @@ class CTraderClient:
         self.pending = []
         self.symbols_loaded_deferred = defer.Deferred() # Thêm Deferred để quản lý việc lấy symbols
         self.subscribed_spots = set() # Lưu các symbol đã subcribed spot
-        self.subscribed_trendbars = {} # Dùng để theo dõi đăng ký trendbar
+        # Các stream live đã active
+        self.live_streams: Set[Tuple[int, int]] = set()
+        # Lưu Deferred đang chờ phản hồi lịch sử cho mỗi (symbolId, period)
+        self.history_pending: Dict[Tuple[int, int], defer.Deferred] = {}
     def start(self):
         """Starts the service"""
         self.client.startService()
@@ -128,7 +132,7 @@ class CTraderClient:
         """Error: Disconnect to cTrader API"""
         print("❌ Disconnected from cTrader API")
         telegram.send("❌ Disconnected from cTrader API")
-        
+
     @inlineCallbacks
     def _run_setup_sequence(self):
         """
@@ -147,7 +151,7 @@ class CTraderClient:
             # 2. Acc Autherize
             acc_auth_req = Protobuf.get('ProtoOAAccountAuthReq', ctidTraderAccountId=int(CTRADER_ACCOUNT_ID), accessToken=CTRADER_ACCESS_TOKEN)
             yield self.client.send(acc_auth_req)
-            print("✅ Acc auth successful.")
+            print
 
             # 3. Get symbols
             print("Đang yêu cầu danh sách cặp tiền...")
@@ -177,11 +181,11 @@ class CTraderClient:
                 if s.symbolName in PAIRS:
                     self.symbol_ids[s.symbolName] = s.symbolId
             if not self.symbols_loaded_deferred.called:
-                 self.symbols_loaded_deferred.callback(None)
+                self.symbols_loaded_deferred.callback(None)
 
         elif ptype == Protobuf.get_type('ProtoOAGetTrendbarsRes'):
             self.handle_trendbars(payload)
-            
+
     def get_symbol_by_id(self, sid):
         for name, i in self.symbol_ids.items():
             if i == sid:
@@ -193,7 +197,7 @@ class CTraderClient:
             if v == period:
                 return k
         return str(period)
-    
+
     @inlineCallbacks
     def subscribe(self, symbol, period):
         yield self.symbols_loaded_deferred
@@ -203,9 +207,14 @@ class CTraderClient:
             return
 
         sid = self.symbol_ids[symbol]
-        if (sid, period) in self.subscribed_trendbars:
+        key = (sid, period)
+        if key in self.live_streams or key in self.history_pending:
             print(f"✅ Đã đăng ký trendbar {symbol}/{self.tf_from_period(period)}.")
             return
+
+        # Tạo Deferred để chờ dữ liệu lịch sử hoàn tất
+        hist_deferred = defer.Deferred()
+        self.history_pending[key] = hist_deferred
 
         # 1. Đăng ký spot nếu chưa có
         if sid not in self.subscribed_spots:
@@ -219,22 +228,10 @@ class CTraderClient:
                 print(f"✅ Đã đăng ký spot thành công cho {symbol}.")
             except Exception as e:
                 print(f"Lỗi đăng ký spot {symbol}: {e}")
+                self.history_pending.pop(key, None)
                 return
 
-        # 2. Đăng ký live trendbar
-        try:
-            print(f"Đang đăng ký live trendbar cho {symbol}...")
-            live_trendbar_req = Protobuf.get('ProtoOASubscribeLiveTrendbarReq',
-                                             ctidTraderAccountId=int(CTRADER_ACCOUNT_ID),
-                                             symbolId=sid, period=period)
-            yield self.client.send(live_trendbar_req)
-            self.subscribed_trendbars[(sid, period)] = True
-            print(f"✅ Đã đăng ký live trendbar thành công cho {symbol}/{self.tf_from_period(period)}.")
-        except Exception as e:
-            print(f"Lỗi subscribe trendbar {symbol}: {e}")
-            return
-
-        # 3. Lấy dữ liệu lịch sử
+        # 2. Yêu cầu dữ liệu lịch sử trước
         try:
             print(f"Đang yêu cầu dữ liệu lịch sử cho {symbol}/{self.tf_from_period(period)}...")
             time_now = datetime.now(timezone.utc)
@@ -253,7 +250,31 @@ class CTraderClient:
             print(f"✅ Đã gửi yêu cầu lấy dữ liệu lịch sử cho {symbol}.")
         except Exception as e:
             print(f"Lỗi lấy trendbar lịch sử {symbol}: {e}")
-            
+            self.history_pending.pop(key, None)
+            return
+
+        # Chờ nhận xong dữ liệu lịch sử
+        try:
+            yield hist_deferred
+        except Exception:
+            self.history_pending.pop(key, None)
+            return
+
+        # Sau khi nhận lịch sử, không xử lý bất kỳ bar nào được như live
+
+        # 3. Đăng ký live trendbar sau khi đã nhận lịch sử
+        try:
+            print(f"Đang đăng ký live trendbar cho {symbol}...")
+            live_trendbar_req = Protobuf.get('ProtoOASubscribeLiveTrendbarReq',
+                                             ctidTraderAccountId=int(CTRADER_ACCOUNT_ID),
+                                             symbolId=sid, period=period)
+            yield self.client.send(live_trendbar_req)
+            self.live_streams.add(key)
+            print(f"✅ Đã đăng ký live trendbar thành công cho {symbol}/{self.tf_from_period(period)}.")
+        except Exception as e:
+            print(f"Lỗi subscribe trendbar {symbol}: {e}")
+            self.live_streams.discard(key)
+            return
     @inlineCallbacks
     def unsubscribe(self, symbol, period):
         sid = self.symbol_ids.get(symbol)
@@ -261,24 +282,40 @@ class CTraderClient:
             return
 
         # Hủy đăng ký live trendbar
-        if (sid, period) in self.subscribed_trendbars:
+        key = (sid, period)
+        if key in self.live_streams:
             try:
                 req = Protobuf.get('ProtoOAUnsubscribeLiveTrendbarReq', ctidTraderAccountId=int(CTRADER_ACCOUNT_ID), symbolId=sid, period=period)
                 yield self.client.send(req)
-                del self.subscribed_trendbars[(sid, period)]
+                self.live_streams.discard(key)
                 print(f"✅ Đã hủy đăng ký trendbar {symbol}/{self.tf_from_period(period)}")
             except Exception as e:
                 print(f"Lỗi khi hủy đăng ký trendbar: {e}")
+        # Dọn dẹp trạng thái lịch sử còn chờ (nếu có)
+        d = self.history_pending.pop(key, None)
+        if d and not d.called:
+            d.cancel()
 
     def handle_trendbars(self, payload):
         symbol = self.get_symbol_by_id(payload.symbolId)
         tf = self.tf_from_period(payload.period)
-        for tb in payload.trendbar:
-            process_trendbar(symbol, tf, tb)
-            
-def process_trendbar(symbol, tf, tb):
+        key = (payload.symbolId, payload.period)
+        bars = list(payload.trendbar)
+        if key in self.history_pending:
+            for tb in bars:
+                process_trendbar(symbol, tf, tb, live=False)
+            d = self.history_pending.pop(key)
+            if not d.called:
+                d.callback(None)
+        else:
+            for tb in bars:
+                process_trendbar(symbol, tf, tb, live=True)
+
+def process_trendbar(symbol, tf, tb, live=True):
     key = (symbol, tf)
     data = market_data[key]
+    if tb.utcTimestampInMinutes <= data["last_ts"]:
+        return
     scale = 1e5
     low = tb.low / scale
     open_ = (tb.low + tb.deltaOpen) / scale
@@ -302,8 +339,10 @@ def process_trendbar(symbol, tf, tb):
     signals = detect_signals(
         data["state"], symbol, tf, closes, highs, lows, list(data["hist"]), tb.utcTimestampInMinutes
     )
-    for s in signals:
-        telegram.send(s)
+    if live:
+        for s in signals:
+            telegram.send(s)
+    data["last_ts"] = tb.utcTimestampInMinutes
 
 HELP_TEXT = (
 "🤖 MACD Divergence Detection Bot \n"
@@ -384,7 +423,7 @@ def main_startup_sequence():
 
 if __name__ == '__main__':
     keep_alive()
-    loop.start(1.0)
+    loop.start(1.0) # Poll Telegram mỗi giây
     # Chạy chuỗi khởi động chính
     main_startup_sequence()
     # Khởi động reactor để chạy các tác vụ bất đồng bộ
