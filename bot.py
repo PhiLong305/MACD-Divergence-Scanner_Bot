@@ -29,6 +29,7 @@ EMA_SLOW = 26
 MACD_SIGNAL = 9
 SCAN_INTERVAL_SEC = 3
 MIN_BARS_BACK = 5000
+HIST_FETCH_BATCH = 1000
 MIN_LOOKBACK_BARS = 10
 MAX_LOOKBACK_BARS = 40
 SLOPE_THRESHOLD = 0.7
@@ -233,18 +234,15 @@ class CTraderClient:
         # 2. Yêu cầu dữ liệu lịch sử trước
         try:
             print(f"Đang yêu cầu dữ liệu lịch sử cho {symbol}/{self.tf_from_period(period)}...")
-            time_now = datetime.now(timezone.utc)
-            period_seconds = period * 60
-            from_ts = int((time_now - timedelta(seconds=period_seconds * MIN_BARS_BACK)).timestamp() * 1000)
-            to_ts = int(time_now.timestamp() * 1000)
-
-            hist_req = Protobuf.get('ProtoOAGetTrendbarsReq',
-                                    ctidTraderAccountId=int(CTRADER_ACCOUNT_ID),
-                                    symbolId=sid,
-                                    period=period,
-                                    fromTimestamp=from_ts,
-                                    toTimestamp=to_ts,
-                                    count=MIN_BARS_BACK)
+            to_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+            hist_req = Protobuf.get(
+                'ProtoOAGetTrendbarsReq',
+                ctidTraderAccountId=int(CTRADER_ACCOUNT_ID),
+                symbolId=sid,
+                period=period,
+                toTimestamp=to_ts,
+                count=min(HIST_FETCH_BATCH, MIN_BARS_BACK),
+            )
             yield self.client.send(hist_req)
             print(f"✅ Đã gửi yêu cầu lấy dữ liệu lịch sử cho {symbol}.")
         except Exception as e:
@@ -290,12 +288,28 @@ class CTraderClient:
         key = (payload.symbolId, payload.period)
         bars = sorted(payload.trendbar, key=lambda b: b.utcTimestampInMinutes)
         if key in self.history_pending:
-            for tb in bars:
+            data_loaded = market_data[(symbol, tf)]["closes"]
+            iterable = bars if not data_loaded else reversed(bars)
+            for tb in iterable:
                 process_trendbar(symbol, tf, tb, live=False)
             count_loaded = len(market_data[(symbol, tf)]["closes"])
-            print(f"📥 Loaded {count_loaded} bars for {symbol}/{tf}")
-            self.history_pending.discard(key)
-            self.subscribed_trendbars[key] = 0
+            if count_loaded < MIN_BARS_BACK:
+                print(f"📥 Loaded {count_loaded} bars for {symbol}/{tf} (need {MIN_BARS_BACK})")
+                oldest_ts = bars[0].utcTimestampInMinutes * 60 * 1000
+                remaining = MIN_BARS_BACK - count_loaded
+                hist_req = Protobuf.get(
+                    'ProtoOAGetTrendbarsReq',
+                    ctidTraderAccountId=int(CTRADER_ACCOUNT_ID),
+                    symbolId=payload.symbolId,
+                    period=payload.period,
+                    toTimestamp=oldest_ts,
+                    count=min(HIST_FETCH_BATCH, remaining),
+                )
+                self.client.send(hist_req)
+            else:
+                print(f"📥 Loaded {count_loaded} bars for {symbol}/{tf}")
+                self.history_pending.discard(key)
+                self.subscribed_trendbars[key] = 0
         else:
             count = self.subscribed_trendbars.get(key, 0)
             if count < 1:
@@ -310,7 +324,7 @@ def process_trendbar(symbol, tf, tb, live=True):
     key = (symbol, tf)
     data = market_data[key]
     ts = tb.utcTimestampInMinutes
-    if ts < data["last_ts"]:
+    if live and ts < data["last_ts"]:
         return
     scale = 1e5
     low = tb.low / scale
@@ -318,10 +332,15 @@ def process_trendbar(symbol, tf, tb, live=True):
     close = (tb.low + tb.deltaClose) / scale
     high = (tb.low + tb.deltaHigh) / scale
     
+
     if ts == data["last_ts"] and data["closes"]:
         data["closes"][-1] = close
-        data["highs"][-1] = high
-        data["lows"][-1] = low
+        data["highs"][-1] = max(data["highs"][-1], high)
+        data["lows"][-1] = min(data["lows"][-1], low)
+    elif not live and ts < data["last_ts"]:
+        data["closes"].appendleft(close)
+        data["highs"].appendleft(high)
+        data["lows"].appendleft(low)
     else:
         data["closes"].append(close)
         data["highs"].append(high)
