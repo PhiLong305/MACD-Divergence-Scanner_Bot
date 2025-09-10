@@ -288,19 +288,22 @@ class CTraderClient:
         symbol = self.get_symbol_by_id(payload.symbolId)
         tf = self.tf_from_period(payload.period)
         key = (payload.symbolId, payload.period)
+        bars = sorted(payload.trendbar, key=lambda b: b.utcTimestampInMinutes)
         if key in self.history_pending:
-            for tb in payload.trendbar:
+            for tb in bars:
                 process_trendbar(symbol, tf, tb, live=False)
+            count_loaded = len(market_data[(symbol, tf)]["closes"])
+            print(f"📥 Loaded {count_loaded} bars for {symbol}/{tf}")
             self.history_pending.discard(key)
             self.subscribed_trendbars[key] = 0
         else:
             count = self.subscribed_trendbars.get(key, 0)
             if count < 1:
-                for tb in payload.trendbar:
+                for tb in bars:
                     process_trendbar(symbol, tf, tb, live=False)
                 self.subscribed_trendbars[key] = count + 1
             else:
-                for tb in payload.trendbar:
+                for tb in bars:
                     process_trendbar(symbol, tf, tb, live=True)
 
 def process_trendbar(symbol, tf, tb, live=True):
@@ -335,11 +338,13 @@ def process_trendbar(symbol, tf, tb, live=True):
     hist = macd_line - signal
     data["hist"].clear()
     data["hist"].extend(hist.tolist())
+    bar_id = ts if live else None
     signals = detect_signals(
         data["state"], symbol, tf, closes, highs, lows, list(data["hist"]), ts
     )
     if live:
         for s in signals:
+            print(s)
             telegram.send(s)
     if ts > data["last_ts"]:
         data["last_ts"] = ts
