@@ -306,16 +306,23 @@ class CTraderClient:
 def process_trendbar(symbol, tf, tb, live=True):
     key = (symbol, tf)
     data = market_data[key]
-    if tb.utcTimestampInMinutes <= data["last_ts"]:
+    ts = tb.utcTimestampInMinutes
+    if ts < data["last_ts"]:
         return
     scale = 1e5
     low = tb.low / scale
     open_ = (tb.low + tb.deltaOpen) / scale
     close = (tb.low + tb.deltaClose) / scale
     high = (tb.low + tb.deltaHigh) / scale
-    data["closes"].append(close)
-    data["highs"].append(high)
-    data["lows"].append(low)
+    
+    if ts == data["last_ts"] and data["closes"]:
+        data["closes"][-1] = close
+        data["highs"][-1] = high
+        data["lows"][-1] = low
+    else:
+        data["closes"].append(close)
+        data["highs"].append(high)
+        data["lows"].append(low)
 
     closes = list(data["closes"])
     highs = list(data["highs"])
@@ -329,12 +336,13 @@ def process_trendbar(symbol, tf, tb, live=True):
     data["hist"].clear()
     data["hist"].extend(hist.tolist())
     signals = detect_signals(
-        data["state"], symbol, tf, closes, highs, lows, list(data["hist"]), tb.utcTimestampInMinutes
+        data["state"], symbol, tf, closes, highs, lows, list(data["hist"]), ts
     )
     if live:
         for s in signals:
             telegram.send(s)
-    data["last_ts"] = tb.utcTimestampInMinutes
+    if ts > data["last_ts"]:
+        data["last_ts"] = ts
 
 HELP_TEXT = (
 "🤖 MACD Divergence Detection Bot \n"
