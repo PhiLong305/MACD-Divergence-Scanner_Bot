@@ -92,6 +92,15 @@ TIMEFRAME_MAP = {
     "4h": ProtoOATrendbarPeriod.H4,
     "1d": ProtoOATrendbarPeriod.D1,
 }
+PERIOD_SECONDS = {
+    ProtoOATrendbarPeriod.M5: 300,
+    ProtoOATrendbarPeriod.M15: 900,
+    ProtoOATrendbarPeriod.M30: 1800,
+    ProtoOATrendbarPeriod.H1: 3600,
+    ProtoOATrendbarPeriod.H4: 14400,
+    ProtoOATrendbarPeriod.D1: 86400,
+    ProtoOATrendbarPeriod.W1: 604800,
+}
 PRESETS = {
     "4T": ["5m", "15m", "30m", "1h"],
     "2t": ["5m", "15m"],
@@ -236,25 +245,36 @@ class CTraderClient:
         try:
             print(f"Đang yêu cầu dữ liệu lịch sử cho {symbol}/{self.tf_from_period(period)}...")
             time_now = datetime.now(timezone.utc)
-            period_seconds = period * 60
-            from_ts = int((time_now - timedelta(seconds=period_seconds * MIN_BARS_BACK)).timestamp() * 1000)
+            period_seconds = PERIOD_SECONDS[period]
+            bars_needed = MIN_BARS_BACK
             to_ts = int(time_now.timestamp() * 1000)
 
-            hist_req = Protobuf.get('ProtoOAGetTrendbarsReq',
-                                    ctidTraderAccountId=int(CTRADER_ACCOUNT_ID),
-                                    symbolId=sid,
-                                    period=period,
-                                    fromTimestamp=from_ts,
-                                    toTimestamp=to_ts,
-                                    count=MIN_BARS_BACK)
-            yield self.client.send(hist_req)
-            print(f"✅ Đã gửi yêu cầu lấy dữ liệu lịch sử cho {symbol}.")
+            while bars_needed > 0:
+                from_ts = to_ts - period_seconds * bars_needed * 2 * 1000
+                req = Protobuf.get('ProtoOAGetTrendbarsReq',
+                                   ctidTraderAccountId=int(CTRADER_ACCOUNT_ID),
+                                   symbolId=sid, period=period,
+                                   fromTimestamp=from_ts, toTimestamp=to_ts,
+                                   count=bars_needed)
+                payload = yield self.client.send(req)
+                bars_received = len(payload.trendbar)
+                bars_needed -= bars_received
+                if bars_received == 0:
+                    break
+                to_ts = payload.trendbar[0].utcTimestampInMinutes * 60 * 1000
+                
         except Exception as e:
             print(f"Lỗi lấy trendbar lịch sử {symbol}: {e}")
             self.history_pending.discard(key)
             self.subscribed_trendbars.pop(key, None)
             return
 
+        if bars_needed != 0:
+            print(f"⚠️ Không thể lấy đủ dữ liệu lịch sử cho {symbol}.")
+            self.history_pending.discard(key)
+            self.subscribed_trendbars.pop(key, None)
+            return
+            
         # 3. Đăng ký live trendbar (sau khi đã yêu cầu đủ data lịch sử)
         try:
             print(f"Đang đăng ký live trendbar cho {symbol}...")
@@ -310,7 +330,7 @@ def process_trendbar(symbol, tf, tb, live=True):
     key = (symbol, tf)
     data = market_data[key]
     
-    # Bỏ qua nến cũ
+    # Bỏ qua trendbar cũ 
     if tb.utcTimestampInMinutes < data["last_ts"]:
         return
         
@@ -322,9 +342,19 @@ def process_trendbar(symbol, tf, tb, live=True):
     high = (tb.low + tb.deltaHigh) / scale
 
     # Lưu dữ liệu
-    data["closes"].append(close)
-    data["highs"].append(high)
-    data["lows"].append(low)
+    if tb.utcTimestampInMinutes == data["last_ts"]:
+        data["closes"][-1] = close
+        data["highs"][-1] = max(data["highs"][-1], high)
+        data["lows"][-1]  = min(data["lows"][-1], low)
+    else:
+        data["closes"].append(close)
+        data["highs"].append(high)
+        data["lows"].append(low)
+
+    # Đếm và in ra số lượng dữ liệu nhận được
+    bar_count = len(data["closes"])
+    required = EMA_SLOW + MACD_SIGNAL
+    print(f"{symbol} {tf}: {bar_count}/{required} bars")
     
     # Tính MACD
     closes = list(data["closes"])
