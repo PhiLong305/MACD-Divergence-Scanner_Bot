@@ -1,15 +1,16 @@
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
-from typing import Dict, Deque, Any, Tuple
-
 from twisted.internet import reactor, task, defer
-from twisted.internet.defer import inlineCallbacks, DeferredList
+from twisted.internet.defer import inlineCallbacks
 import treq
+import json
+import os
 from ctrader_open_api import Client, TcpProtocol, Protobuf
 from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOATrendbarPeriod
 from keep_alive import keep_alive
 from divergence import DivergenceState, detect_signals
+
 # ================== CONFIGURATION ==================
 TELEGRAM_TOKEN = "8358892572:AAHFNZWXwwd_VIL7veQgdLBjNjI253oLCug"
 CHAT_ID = "1676202517"
@@ -18,72 +19,29 @@ CTRADER_CLIENT_ID = "16778_at26WTcoFS2NYt1GHQS1gJqaSWorbHZCJKA1X9KRe2z5dZRrMo"
 CTRADER_SECRET = "unq1iRL42CtmzTk5MQ9CYdcMfnYmOQSV5Nfu94FEX0ZueystC3"
 CTRADER_ACCOUNT_ID = "44322853"
 CTRADER_ACCESS_TOKEN = "zVuuTkkAeB_uR0htxndUSRztpBuH6n5h0_2S3K2j6zw"
+CTRADER_REFRESH_TOKEN = "vad60eaFw4bMvn8OrPEAuizInEJjK_CHwMc3QJO3LOI"
 CTRADER_DEMO_HOST = "demo.ctraderapi.com"
 CTRADER_DEMO_PORT = 5035
+
+# File lưu token info (Application Spotware)
+TOKEN_FILE = "token_info.json"    # File lưu thông tin token
+TOKEN_REFRESH_MARGIN_MINUTES = 5  # Refresh token 5 phút trước khi hết hạn
+
 PAIRS = [
     "XAUUSD", "EURUSD", "EURAUD", "EURCAD", "EURCHF", "EURGBP", "EURNZD",
     "GBPUSD", "GBPAUD", "GBPCAD", "GBPCHF", "GBPNZD", "AUDUSD", "AUDCAD",
     "AUDCHF", "AUDNZD", "CADCHF", "USDCHF", "USDCAD", "NZDUSD", "NZDCAD", "NZDCHF"
 ]
+
 EMA_FAST = 12
 EMA_SLOW = 26
 MACD_SIGNAL = 9
-SCAN_INTERVAL_SEC = 3         # Polling Telegram mỗi 3s
+SCAN_INTERVAL_SEC = 3
 MIN_BARS_BACK = 5000
 MIN_LOOKBACK_BARS = 10
 MAX_LOOKBACK_BARS = 40
 SLOPE_THRESHOLD = 0.7
-# =============================================
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-class TelegramBot:
-    def __init__(self):
-        self.offset = 0      # Offset cho polling updates
-    def send(self, text):
-        d = treq.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": CHAT_ID, "text": text})
-        # Thêm hàm xử lý lỗi Telegram messenge và gắn nó vào Deferred (d)
-        def on_error(failure):
-            print(f"❌ Lỗi khi gửi tin nhắn Telegram: {failure.getErrorMessage()}")
-            return None
-        d.addErrback(on_error)
-        return d
-    def poll(self):
-        d = treq.get(f"{TELEGRAM_API}/getUpdates", params={"timeout":0, "offset": self.offset + 1})
-        d.addCallback(treq.json_content)
-        d.addCallback(self._handle_updates)
-        d.addErrback(lambda _: None)
-    def _handle_updates(self, data):
-        for upd in data.get("result", []):
-            self.offset = upd["update_id"]
-            msg = upd.get("message", {})
-            text = msg.get("text", "").strip()
-            if not text:
-                continue
-            self.handle_command(text)
-    def handle_command(self, text):
-        if text.startswith("/help"):
-            self.send(HELP_TEXT)
-        elif text.startswith("/pairs"):
-            pairs = "\n".join(f"{i+1}. {p}" for i,p in enumerate(PAIRS))
-            self.send(f"📊 Pairs watching:\n{pairs}")
-        elif text.startswith("/status"):
-            self.send_status()
-        elif text.startswith("/stop"):
-            stop_scanning()
-            self.send("🛑 Scanning stopped")
-        elif text.startswith("/scan"):
-            parts = text.split(maxsplit=1)
-            if len(parts) == 2:
-                start_scanning(parts[1].strip())
-            else:
-                self.send("⚠️ Missing timeframe. Usage: /scan 5m")
-        else:
-            self.send(f"Echo: {text}")
-    def send_status(self):
-        if active_timeframes:
-            tfs = ", ".join(sorted(active_timeframes))
-            self.send(f"✅ Scanning active\nTimeframes: {tfs}\nPairs: {len(PAIRS)}")
-        else:
-            self.send("⚠️ Bot is idle. Use /scan to start.")
+
 TIMEFRAME_MAP = {
     "5m": ProtoOATrendbarPeriod.M5,
     "15m": ProtoOATrendbarPeriod.M15,
@@ -112,34 +70,218 @@ market_data = defaultdict(lambda: {
     "lows": deque(maxlen=MIN_BARS_BACK),
     "hist": deque(maxlen=MIN_BARS_BACK),
     "state": DivergenceState(),
-    "last_ts": 0,     # Timestamp cuối
+    "last_ts": 0,
+    "bar_count": 0,          # Đếm tổng số bar nhận được
+    "history_bars": 0,       # Đếm bar lịch sử
+    "live_bars": 0,          # Đếm bar live
+    "first_bar_time": None,  # Thời gian bar đầu tiên
+    "last_bar_time": None,   # Thời gian bar cuối cùng
 })
-active_timeframes = set()   # Lưu các timeframe đang active
+active_timeframes = set()
 
+# ================== BAR COUNTER SYSTEM ==================
+bar_stats = defaultdict(lambda: {
+    "total_bars": 0,
+    "history_bars": 0,
+    "live_bars": 0,
+    "first_received": None,
+    "last_received": None,
+    "data_quality": "Unknown"
+})
+
+def print_bar_stats():
+    """In thống kê số lượng bar nhận được theo milestone"""
+    if not bar_stats:
+        print("📊 Chưa có dữ liệu bar nào")
+        return
+
+    print("\n" + "="*60)
+    print("📊 BAR STATISTICS REPORT")
+    print("="*60)
+
+    for key, stats in bar_stats.items():
+        symbol, tf = key
+        total = stats['total_bars']
+        progress = f"{total}/{MIN_BARS_BACK}"
+        percentage = (total / MIN_BARS_BACK * 100) if total > 0 else 0
+
+        print(f"🔹 {symbol}/{tf}: {progress} ({percentage:.1f}%)")
+        print(f"   📜 History: {stats['history_bars']} | 🔴 Live: {stats['live_bars']}")
+
+        # Đánh giá chất lượng dựa trên tỷ lệ hoàn thành
+        if percentage >= 80:
+            quality = "✅ Excellent"
+        elif percentage >= 50:
+            quality = "🟡 Good"  
+        elif percentage >= 20:
+            quality = "🟠 Fair"
+        else:
+            quality = "🔴 Poor"
+
+        print(f"   📋 Quality: {quality}")
+
+    print("="*60)
+
+def get_bar_summary():
+    """Tạo summary ngắn gọn về bar stats"""
+    if not bar_stats:
+        return "📊 No bar data available"
+
+    total_symbols = len(bar_stats)
+    total_bars = sum(stats['total_bars'] for stats in bar_stats.values())
+    total_live = sum(stats['live_bars'] for stats in bar_stats.values())
+
+    return f"📊 {total_symbols} symbols | {total_bars} total bars | {total_live} live bars"
+
+def reset_bar_stats():
+    """Reset tất cả thống kê bar"""
+    bar_stats.clear()
+    for key in market_data.keys():
+        market_data[key]["bar_count"] = 0
+        market_data[key]["history_bars"] = 0
+        market_data[key]["live_bars"] = 0
+        market_data[key]["first_bar_time"] = None
+        market_data[key]["last_bar_time"] = None
+    print("🔄 Đã reset tất cả bar statistics")
+
+class TokenManager:
+    """Quản lý Access Token và Refresh Token"""
+
+    def __init__(self):
+        self.access_token = CTRADER_ACCESS_TOKEN
+        self.refresh_token = CTRADER_REFRESH_TOKEN
+        self.expires_at = None
+        self.refresh_task = None
+        self.load_token_info()
+
+    def load_token_info(self):
+        """Tải thông tin token từ file"""
+        try:
+            if os.path.exists(TOKEN_FILE):
+                with open(TOKEN_FILE, 'r') as f:
+                    data = json.load(f)
+                    self.access_token = data.get('access_token', CTRADER_ACCESS_TOKEN)
+                    self.refresh_token = data.get('refresh_token', CTRADER_REFRESH_TOKEN)
+                    expires_str = data.get('expires_at')
+                    if expires_str:
+                        self.expires_at = datetime.fromisoformat(expires_str.replace('Z', '+00:00'))
+                    print(f"✅ Đã tải token info từ {TOKEN_FILE}")
+        except Exception as e:
+            print(f"⚠️ Không thể tải token info: {e}")
+
+    def save_token_info(self):
+        """Lưu thông tin token vào file"""
+        try:
+            data = {
+                'access_token': self.access_token,
+                'refresh_token': self.refresh_token,
+                'expires_at': self.expires_at.isoformat() if self.expires_at else None,
+                'updated_at': datetime.now(timezone.utc).isoformat()
+            }
+            with open(TOKEN_FILE, 'w') as f:
+                json.dump(data, f, indent=2)
+            print(f"✅ Đã lưu token info vào {TOKEN_FILE}")
+        except Exception as e:
+            print(f"❌ Lỗi lưu token info: {e}")
+
+    def update_tokens(self, access_token, refresh_token=None, expires_in_seconds=None):
+        """Cập nhật token info"""
+        self.access_token = access_token
+        if refresh_token:
+            self.refresh_token = refresh_token
+
+        if expires_in_seconds:
+            self.expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)
+        elif not self.expires_at:
+            # Mặc định access token có hạn 30 ngày
+            self.expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+
+        self.save_token_info()
+        self.schedule_refresh()
+
+    def should_refresh_token(self):
+        """Kiểm tra có cần refresh token không"""
+        if not self.expires_at:
+            return False
+
+        time_until_expiry = self.expires_at - datetime.now(timezone.utc)
+        return time_until_expiry.total_seconds() <= (TOKEN_REFRESH_MARGIN_MINUTES * 60)
+
+    def schedule_refresh(self):
+        """Lên lịch refresh token"""
+        if self.refresh_task and self.refresh_task.active():
+            self.refresh_task.cancel()
+
+        if not self.expires_at:
+            return
+
+        time_until_refresh = self.expires_at - datetime.now(timezone.utc) - timedelta(minutes=TOKEN_REFRESH_MARGIN_MINUTES)
+
+        if time_until_refresh.total_seconds() > 0:
+            self.refresh_task = reactor.callLater(
+                time_until_refresh.total_seconds(),
+                lambda: ctrader.refresh_access_token()
+            )
+            print(f"📅 Đã lên lịch refresh token lúc: {(datetime.now(timezone.utc) + time_until_refresh).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        else:
+            # Token sắp hết hạn, refresh ngay
+            reactor.callLater(0, lambda: ctrader.refresh_access_token())
+            
 class CTraderClient:
     def __init__(self):
         self.client = Client(CTRADER_DEMO_HOST, CTRADER_DEMO_PORT, TcpProtocol)
         self.client.setConnectedCallback(self.on_Connected)
         self.client.setDisconnectedCallback(self.on_Disconnected)
         self.client.setMessageReceivedCallback(self.on_Message)
-        self.symbol_ids = {}            # Map symbol name -> ID
-        self.pending = []             
-        self.symbols_loaded_deferred = defer.Deferred()  # Đợi load symbols
-        self.subscribed_spots = set()   # Lưu các symbol đã subcribed spot
-        self.subscribed_trendbars = {}  # Track trendbar subscriptions
-        self.history_pending = set()    # (symbolId, period) đang chờ dữ liệu lịch sử
+        self.symbol_ids = {}
+        self.pending = []
+        self.symbols_loaded_deferred = defer.Deferred() # Thêm Deferred để quản lý việc lấy symbols
+        self.subscribed_spots = set()  # Set lưu các symbol đã subcribed spot
+        self.subscribed_trendbars = {} # Dùng để theo dõi đăng ký trendbar
+        self.history_pending = set()   # Set lưu trữ các key đang trong trạng thái chờ nhận dữ liệu nến lịch sử.
+        self.token_manager = TokenManager()
+        self.refresh_in_progress = False
+        
     def start(self):
         """Starts the service"""
         self.client.startService()
     def on_Connected(self, client_instance):
-        """Connect to cTrader API"""
         print("✅ Connected to API")
-        # NGAY LẬP TỨC gọi chuỗi xác thực sau khi kết nối
-        self._run_setup_sequence()
+        # Check token trước khi bắt đầu gọi chuỗi xác thực sau Connected
+        if self.token_manager.should_refresh_token() and self.token_manager.refresh_token:
+            print("🔄 Token sắp hết hạn, thực hiện refresh...")
+            self.refresh_access_token()
+        else:
+            self._run_setup_sequence()
     def on_Disconnected(self, _, reason):
-        """Error: Disconnect to cTrader API"""
         print("❌ Disconnected from cTrader API")
         telegram.send("❌ Disconnected from cTrader API")
+        reactor.stop()
+
+    @inlineCallbacks
+    def refresh_access_token(self):
+        """Refresh access token using refresh token"""
+        if self.refresh_in_progress:
+            print("🔄 Refresh đang được thực hiện...")
+            return
+
+        if not self.token_manager.refresh_token:
+            print("❌ Không có refresh token để thực hiện refresh")
+            telegram.send("❌ Không có refresh token - cần cập nhật thủ công")
+            return
+
+        try:
+            self.refresh_in_progress = True
+            print("🔄 Đang refresh access token...")
+
+            refresh_req = Protobuf.get('ProtoOARefreshTokenReq', 
+                                     refreshToken=self.token_manager.refresh_token)
+            yield self.client.send(refresh_req)
+
+        except Exception as e:
+            print(f"❌ Lỗi khi refresh token: {e}")
+            telegram.send(f"❌ Lỗi refresh token: {e}")
+            self.refresh_in_progress = False
 
     @inlineCallbacks
     def _run_setup_sequence(self):
@@ -157,7 +299,7 @@ class CTraderClient:
             print("✅ App auth successful.")
 
             # 2. Acc Autherize
-            acc_auth_req = Protobuf.get('ProtoOAAccountAuthReq', ctidTraderAccountId=int(CTRADER_ACCOUNT_ID), accessToken=CTRADER_ACCESS_TOKEN)
+            acc_auth_req = Protobuf.get('ProtoOAAccountAuthReq', ctidTraderAccountId=int(CTRADER_ACCOUNT_ID), accessToken=self.token_manager.access_token)
             yield self.client.send(acc_auth_req)
             print("✅ Acc auth successful.")
 
@@ -166,35 +308,70 @@ class CTraderClient:
             symbols_list_req = Protobuf.get('ProtoOASymbolsListReq', ctidTraderAccountId=int(CTRADER_ACCOUNT_ID), includeArchivedSymbols=False)
             yield self.client.send(symbols_list_req)
 
-            # Đợi symbols được load xong
+            # Đợi hàm on_Message xử lý phản hồi từ server
             yield self.symbols_loaded_deferred
             print("✅ Đã tải xong danh sách các cặp tiền.")
 
         except Exception as e:
-            print(f"❌ Lỗi trong quá trình thiết lập: {e}")
+            print(f"❌ Lỗi trong quá trình thiết lập ban đầu: {e}")
             self.client.stopService()
+            reactor.stop()
+            
     def on_Message(self, _, message):
         """Hàm callback khi nhận tin nhắn từ server."""
+
+        # Giải mã decode thô từ server trả về
         payload = Protobuf.extract(message)
         ptype = payload.payloadType
 
-        # Print ra lỗi từ API
+        # Nếu là dạng tin nhắn Error -> Print ra lỗi từ API
         if ptype == Protobuf.get_type('ProtoOAErrorRes'):
             print(f"Server Error: Code {payload.errorCode}, Message: {payload.description}")
+            # Nếu lỗi liên quan đến token
+            if payload.errorCode in ["INVALID_TOKEN", "TOKEN_EXPIRED"]:
+                telegram.send("❌ Token hết hạn hoặc không hợp lệ!")
             return
-
-        # Khi nhận được danh sách symbols, gán vào self.symbol_ids và thông báo Deferred đã hoàn thành
+        # Xử lý phản hồi refresh token
+        elif ptype == Protobuf.get_type('ProtoOARefreshTokenRes'):
+            self.handle_refresh_token_response(payload)
+            return
+            
+        # Nếu là dạng SymbolListRes, Khi received danh sách symbols, gán vào self.symbol_ids và thông báo Deferred đã hoàn thành
         if ptype == Protobuf.get_type('ProtoOASymbolsListRes'):
             for s in payload.symbol:
                 if s.symbolName in PAIRS:
                     self.symbol_ids[s.symbolName] = s.symbolId
             if not self.symbols_loaded_deferred.called:
                  self.symbols_loaded_deferred.callback(None)
-
+                
+        # Nếu là type TrendbarsRes, gọi hàm xử lý 
         elif ptype == Protobuf.get_type('ProtoOAGetTrendbarsRes'):
             self.handle_trendbars(payload)
 
-    def get_symbol_by_id(self, sid):
+    def handle_refresh_token_response(self, payload):
+        """Xử lý phản hồi refresh token"""
+        try:
+            # Cập nhật token mới
+            self.token_manager.update_tokens(
+                access_token=payload.accessToken,
+                refresh_token=getattr(payload, 'refreshToken', None),
+                expires_in_seconds=getattr(payload, 'expiresIn', None)
+            )
+
+            print("✅ Refresh token thành công!")
+            telegram.send("🔄 Access token đã được refresh thành công!")
+
+            # Tiếp tục với setup nếu chưa hoàn thành
+            if not hasattr(self, 'symbols_loaded_deferred') or not self.symbols_loaded_deferred.called:
+                self._run_setup_sequence()
+
+        except Exception as e:
+            print(f"❌ Lỗi xử lý refresh token response: {e}")
+            telegram.send(f"❌ Lỗi xử lý refresh token: {e}")
+        finally:
+            self.refresh_in_progress = False
+    
+    def get_symbol_name_by_id(self, sid):
         for name, i in self.symbol_ids.items():
             if i == sid:
                 return name
@@ -208,12 +385,11 @@ class CTraderClient:
 
     @inlineCallbacks
     def subscribe(self, symbol, period):
-        # Đợi symbols được load
-        yield self.symbols_loaded_deferred
+        yield self.symbols_loaded_deferred # Chờ cho đến khi received Symbol List
 
         if symbol not in self.symbol_ids:
-            print(f"❌ Cặp tiền {symbol} không tìm thấy.")
-            return  # Đã đăng ký rồi
+            print(f"❌ Cặp tiền {symbol} không tìm thấy trong PAIRS.")
+            return
 
         sid = self.symbol_ids[symbol]
         key = (sid, period)
@@ -221,61 +397,34 @@ class CTraderClient:
             print(f"✅ Đã đăng ký trendbar {symbol}/{self.tf_from_period(period)}.")
             return
 
-        # Đánh dấu (symbolId, period) đang chờ dữ liệu lịch sử
-        self.history_pending.add(key)
+        # Đánh dấu (symbolId, period) đang chờ dữ liệu lịch sử và trạng thái subcribe (0:history / 1:live)
+        self.history_pending.add(key)      # Add key vào set hàng chờ nhận dữ liệu lịch sử
         self.subscribed_trendbars[key] = 0
 
-        # 1. Đăng ký spot prices (nếu chưa có)
-        if sid not in self.subscribed_spots:
-            try:
-                print(f"Đang đăng ký spot cho {symbol}...")
-                spot_req = Protobuf.get('ProtoOASubscribeSpotsReq',
-                                        ctidTraderAccountId=int(CTRADER_ACCOUNT_ID),
-                                        symbolId=[sid])
-                yield self.client.send(spot_req)
-                self.subscribed_spots.add(sid)
-                print(f"✅ Đã đăng ký spot thành công cho {symbol}.")
-            except Exception as e:
-                print(f"Lỗi đăng ký spot {symbol}: {e}")
-                self.history_pending.discard(key)
-                self.subscribed_trendbars.pop(key, None)
-                return
-
-        # 2. Yêu cầu dữ liệu lịch sử
+        # 1. Yêu cầu dữ liệu lịch sử
         try:
             print(f"Đang yêu cầu dữ liệu lịch sử cho {symbol}/{self.tf_from_period(period)}...")
             time_now = datetime.now(timezone.utc)
             period_seconds = PERIOD_SECONDS[period]
-            bars_needed = MIN_BARS_BACK
+            from_ts = int((time_now - timedelta(seconds=period_seconds * MIN_BARS_BACK)).timestamp() * 1000)
             to_ts = int(time_now.timestamp() * 1000)
 
-            while bars_needed > 0:
-                from_ts = to_ts - period_seconds * bars_needed * 2 * 1000
-                req = Protobuf.get('ProtoOAGetTrendbarsReq',
-                                   ctidTraderAccountId=int(CTRADER_ACCOUNT_ID),
-                                   symbolId=sid, period=period,
-                                   fromTimestamp=from_ts, toTimestamp=to_ts,
-                                   count=bars_needed)
-                payload = yield self.client.send(req)
-                bars_received = len(payload.trendbar)
-                bars_needed -= bars_received
-                if bars_received == 0:
-                    break
-                to_ts = payload.trendbar[0].utcTimestampInMinutes * 60 * 1000
-                
+            hist_req = Protobuf.get('ProtoOAGetTrendbarsReq',
+                                    ctidTraderAccountId=int(CTRADER_ACCOUNT_ID),
+                                    symbolId=sid,
+                                    period=period,
+                                    fromTimestamp=from_ts,
+                                    toTimestamp=to_ts,
+                                    count=MIN_BARS_BACK)
+            yield self.client.send(hist_req)
+            print(f"✅ Đã gửi yêu cầu lấy dữ liệu lịch sử cho {symbol}.")
         except Exception as e:
             print(f"Lỗi lấy trendbar lịch sử {symbol}: {e}")
             self.history_pending.discard(key)
             self.subscribed_trendbars.pop(key, None)
             return
 
-        if bars_needed != 0:
-            print(f"⚠️ Không thể lấy đủ dữ liệu lịch sử cho {symbol}.")
-            self.history_pending.discard(key)
-            self.subscribed_trendbars.pop(key, None)
-            return
-            
-        # 3. Đăng ký live trendbar (sau khi đã yêu cầu đủ data lịch sử)
+        # 2. Đăng ký live trendbar sau khi đã yêu cầu lịch sử
         try:
             print(f"Đang đăng ký live trendbar cho {symbol}...")
             live_trendbar_req = Protobuf.get('ProtoOASubscribeLiveTrendbarReq',
@@ -300,17 +449,18 @@ class CTraderClient:
                 req = Protobuf.get('ProtoOAUnsubscribeLiveTrendbarReq', ctidTraderAccountId=int(CTRADER_ACCOUNT_ID), symbolId=sid, period=period)
                 yield self.client.send(req)
                 del self.subscribed_trendbars[(sid, period)]
-                print(f"✅ Đã hủy đăng ký trendbar {symbol}/{self.tf_from_period(period)}")
+                print(f"✅ Đã hủy đăng ký Live trendbar {symbol}/{self.tf_from_period(period)}")
             except Exception as e:
-                print(f"Lỗi khi hủy đăng ký trendbar: {e}")
-                
+                print(f"Lỗi khi hủy đăng ký Live trendbar: {e}")
         # Dọn dẹp trạng thái lịch sử còn chờ (nếu có)
         self.history_pending.discard((sid, period))
 
     def handle_trendbars(self, payload):
-        symbol = self.get_symbol_by_id(payload.symbolId)
+        symbol = self.get_symbol_name_by_id(payload.symbolId)
         tf = self.tf_from_period(payload.period)
         key = (payload.symbolId, payload.period)
+        
+        # Xử lý đối với dữ liệu lịch sử
         if key in self.history_pending:
             for tb in payload.trendbar:
                 process_trendbar(symbol, tf, tb, live=False)
@@ -329,34 +479,16 @@ class CTraderClient:
 def process_trendbar(symbol, tf, tb, live=True):
     key = (symbol, tf)
     data = market_data[key]
-    
-    # Bỏ qua trendbar cũ 
-    if tb.utcTimestampInMinutes < data["last_ts"]:
+    if tb.utcTimestampInMinutes <= data["last_ts"]:
         return
-        
-    # Chuyển đổi giá từ format cTrader
     scale = 1e5
     low = tb.low / scale
-    open_ = (tb.low + tb.deltaOpen) / scale
     close = (tb.low + tb.deltaClose) / scale
     high = (tb.low + tb.deltaHigh) / scale
+    data["closes"].append(close)
+    data["highs"].append(high)
+    data["lows"].append(low)
 
-    # Lưu dữ liệu
-    if tb.utcTimestampInMinutes == data["last_ts"]:
-        data["closes"][-1] = close
-        data["highs"][-1] = max(data["highs"][-1], high)
-        data["lows"][-1]  = min(data["lows"][-1], low)
-    else:
-        data["closes"].append(close)
-        data["highs"].append(high)
-        data["lows"].append(low)
-
-    # Đếm và in ra số lượng dữ liệu nhận được
-    bar_count = len(data["closes"])
-    required = EMA_SLOW + MACD_SIGNAL
-    print(f"{symbol} {tf}: {bar_count}/{required} bars")
-    
-    # Tính MACD
     closes = list(data["closes"])
     highs = list(data["highs"])
     lows = list(data["lows"])
@@ -366,22 +498,150 @@ def process_trendbar(symbol, tf, tb, live=True):
     macd_line = ema_fast - ema_slow
     signal = macd_line.ewm(span=MACD_SIGNAL, adjust=False).mean()
     hist = macd_line - signal
-
-    # Cập nhật histogram
     data["hist"].clear()
     data["hist"].extend(hist.tolist())
 
-    # Phát hiện tín hiệu divergence
+    # Detect Signals
     signals = detect_signals(
         data["state"], symbol, tf, closes, highs, lows, list(data["hist"]), tb.utcTimestampInMinutes
-    )
-    
-    # Chỉ gửi tín hiệu khi là live data
+    )  
     if live:
         for s in signals:
             telegram.send(s)
     data["last_ts"] = tb.utcTimestampInMinutes
 
+    # Print package milestone cho history bars (every package:1000 bars)
+    total_bars = data["bar_count"]
+    if not live and total_bars % 1000 == 0:
+        percentage = (total_bars / MIN_BARS_BACK * 100) if total_bars > 0 else 0
+        print(f"📊 {symbol}/{tf}: {total_bars}/{MIN_BARS_BACK} ({percentage:.1f}%) - History milestone")
+
+    # Print periodic stats cho live bars (every:10 bars)  
+    if live and data["live_bars"] % 10 == 0:
+        bar_time = datetime.fromtimestamp(tb.utcTimestampInMinutes * 60, timezone.utc)
+        print(f"🔴 {symbol}/{tf}: {data['live_bars']} live bars | Latest: {bar_time.strftime('%H:%M')}")
+
+# TELEGRAM BOT =============================================
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+class TelegramBot:
+    def __init__(self):
+        self.offset = 0
+    
+    def send(self, text):
+        d = treq.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": CHAT_ID, "text": text})
+        # Thêm hàm xử lý lỗi Telegram messenge và gắn nó vào Deferred (d)
+        def on_error(failure):
+            print(f"❌ Lỗi khi gửi tin nhắn Telegram: {failure.getErrorMessage()}")
+            return None
+        d.addErrback(on_error)
+        return d
+        
+    def poll(self):
+        d = treq.get(f"{TELEGRAM_API}/getUpdates", params={"timeout":0, "offset": self.offset + 1})
+        d.addCallback(treq.json_content)
+        d.addCallback(self._handle_updates)
+        d.addErrback(lambda _: None)
+        
+    def _handle_updates(self, data):
+        for upd in data.get("result", []):
+            self.offset = upd["update_id"]
+            msg = upd.get("message", {})
+            text = msg.get("text", "").strip()
+            if not text:
+                continue
+            self.handle_command(text)
+            
+    def handle_command(self, text):
+        if text.startswith("/help"):
+            self.send(HELP_TEXT)
+        elif text.startswith("/pairs"):
+            pairs = "\n".join(f"{i+1}. {p}" for i,p in enumerate(PAIRS))
+            self.send(f"📊 Pairs watching:\n{pairs}")
+        elif text.startswith("/status"):
+            self.send_status()
+        elif text.startswith("/token status"):
+            self.send_token_status()
+        elif text.startswith("/refresh"):
+            ctrader.refresh_access_token()
+        elif cmd == "/bars":
+            self.send_bar_stats()
+        elif cmd == "/reset_bars":
+            reset_bar_stats()
+            self.send_telegram("✅ Bar statistics reset")
+        elif cmd == "/print_bars":
+            print_bar_stats()
+            self.send_telegram("📊 Printed bar stats to console")
+        elif text.startswith("/stop"):
+            stop_scanning()
+            self.send("🛑 Scanning stopped")
+        elif text.startswith("/scan"):
+            parts = text.split(maxsplit=1)
+            if len(parts) == 2:
+                start_scanning(parts[1].strip())
+            else:
+                self.send("⚠️ Missing timeframe. Usage: /scan {timeframe}")
+        else:
+            self.send(f"Echo: {text}")
+            
+    def send_status(self):
+        if active_timeframes:
+            tfs = ", ".join(sorted(active_timeframes))
+            self.send(f"✅ Scanning active\nTimeframes: {tfs}\nPairs: {len(PAIRS)}")
+        else:
+            self.send("⚠️ Bot is idle. Use /scan to start.")
+            
+    def send_token_status(self):
+        """Gửi thông tin trạng thái token"""
+        tm = ctrader.token_manager
+        if tm.expires_at:
+            time_left = tm.expires_at - datetime.now(timezone.utc)
+            days_left = time_left.days
+            hours_left = time_left.seconds // 3600
+
+            status = f"🔑 TOKEN STATUS\n"
+            status += f"⏰ Expires: {tm.expires_at.strftime('%Y-%m-%d %H:%M UTC')}\n"
+            status += f"⏳ Time left: {days_left}d {hours_left}h\n"
+            status += f"🔄 Refresh token: {'✅' if tm.refresh_token else '❌'}\n"
+            status += f"📅 Auto refresh: {'✅' if tm.refresh_task and tm.refresh_task.active() else '❌'}"
+        else:
+            status = "⚠️ Không có thông tin thời hạn token"
+
+        self.send(status)
+        
+    def send_bar_stats(self):
+        """Gửi thống kê bar qua Telegram - Tổng kết ngắn gọn"""
+        if not bar_stats:
+            self.send("📊 Chưa có dữ liệu bar nào")
+            return
+
+        message = f"📊 BAR SUMMARY ({len(bar_stats)} symbols)\n"
+        message += "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+
+        # Sắp xếp theo tên symbol để dễ đọc
+        sorted_stats = sorted(bar_stats.items(), key=lambda x: (x[0][0], x[0][1]))
+
+        for (symbol, tf), stats in sorted_stats:
+            total = stats['total_bars']
+            progress = f"{total}/{MIN_BARS_BACK}"
+            percentage = (total / MIN_BARS_BACK * 100) if total > 0 else 0
+
+            # Icon dựa trên tỷ lệ hoàn thành
+            if percentage >= 80:
+                icon = "✅"
+            elif percentage >= 50:
+                icon = "🟡"
+            elif percentage >= 20:
+                icon = "🟠"
+            else:
+                icon = "🔴"
+
+            message += f"{icon} {symbol}/{tf}: {progress}\n"
+
+        message += "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        message += "💡 /print_bars for detailed console view"
+
+        self.send(message)
+        
 HELP_TEXT = (
 "🤖 MACD Divergence Detection Bot \n"
 "📈 Tính năng chính:\n"
@@ -389,9 +649,16 @@ HELP_TEXT = (
 "• Theo dõi realtime từ IC Markets\n"
 "• Hỗ trợ 22 cặp tiền chính\n"
 "• Đa timeframe scanning\n"
+"• Auto refresh token\n"
+"• Bar counting & monitoring\n"
 "🛠️ Available Commands:\n"
 "/help - Hướng dẫn & hỗ trợ\n"
 "/status - Kiểm tra trạng thái bot\n"
+"/token - Kiểm tra trạng thái token\n"
+"/refresh - Thủ công refresh token\n"
+"/bars - Xem thống kê bar data\n"
+"/print_bars - In chi tiết bar stats (console)\n"
+"/reset_bars - Reset bar statistics\n"
 "/stop - Stop scanning\n"
 "/pairs - Danh sách cặp tiền theo dõi\n"
 "/scan [timeframe] - Start scanning\n"
@@ -408,10 +675,10 @@ loop = task.LoopingCall(telegram.poll)
 @inlineCallbacks
 def start_scanning(tf_text):
     """
-    Hàm bắt đầu quét, đảm bảo bot đã sẵn sàng trước khi đăng ký
+    Hàm bắt đầu Scanning, đảm bảo bot đã sẵn sàng trước khi đăng ký
     """
-    print("🚀 Đang khởi động quét...")
-    # Chờ cho đến khi danh sách symbols được tải xong
+    print("🚀 Đang khởi động Scanning...")
+    # Chờ ở đây cho đến khi danh sách symbols được tải xong
     yield ctrader.symbols_loaded_deferred
 
     # Sau khi chắc chắn đã sẵn sàng, mới bắt đầu đăng ký
@@ -438,7 +705,9 @@ def stop_scanning():
     active_timeframes.clear()
     market_data.clear()
     telegram.send("🛑 Scanning stopped")
-
+    print("\n🛑 FINAL BAR STATISTICS BEFORE STOP:")
+    print_bar_stats()
+    
 # KHỞI ĐỘNG BOT
 def main_startup_sequence():
     """
