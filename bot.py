@@ -226,7 +226,7 @@ class TokenManager:
         else:
             # Token sắp hết hạn, refresh ngay
             reactor.callLater(0, lambda: ctrader.refresh_access_token())
-            
+
 class CTraderClient:
     def __init__(self):
         self.client = Client(CTRADER_DEMO_HOST, CTRADER_DEMO_PORT, TcpProtocol)
@@ -241,7 +241,7 @@ class CTraderClient:
         self.history_pending = set()   # Set lưu trữ các key đang trong trạng thái chờ nhận dữ liệu nến lịch sử.
         self.token_manager = TokenManager()
         self.refresh_in_progress = False
-        
+
     def start(self):
         """Starts the service"""
         self.client.startService()
@@ -316,7 +316,7 @@ class CTraderClient:
             print(f"❌ Lỗi trong quá trình thiết lập ban đầu: {e}")
             self.client.stopService()
             reactor.stop()
-            
+
     def on_Message(self, _, message):
         """Hàm callback khi nhận tin nhắn từ server."""
 
@@ -335,7 +335,7 @@ class CTraderClient:
         elif ptype == Protobuf.get_type('ProtoOARefreshTokenRes'):
             self.handle_refresh_token_response(payload)
             return
-            
+
         # Nếu là dạng SymbolListRes, Khi received danh sách symbols, gán vào self.symbol_ids và thông báo Deferred đã hoàn thành
         if ptype == Protobuf.get_type('ProtoOASymbolsListRes'):
             for s in payload.symbol:
@@ -343,7 +343,7 @@ class CTraderClient:
                     self.symbol_ids[s.symbolName] = s.symbolId
             if not self.symbols_loaded_deferred.called:
                  self.symbols_loaded_deferred.callback(None)
-                
+
         # Nếu là type TrendbarsRes, gọi hàm xử lý 
         elif ptype == Protobuf.get_type('ProtoOAGetTrendbarsRes'):
             self.handle_trendbars(payload)
@@ -370,7 +370,7 @@ class CTraderClient:
             telegram.send(f"❌ Lỗi xử lý refresh token: {e}")
         finally:
             self.refresh_in_progress = False
-    
+
     def get_symbol_name_by_id(self, sid):
         for name, i in self.symbol_ids.items():
             if i == sid:
@@ -424,34 +424,12 @@ class CTraderClient:
             self.subscribed_trendbars.pop(key, None)
             return
 
-        # 2. Đăng ký live trendbar sau khi đã yêu cầu lịch sử
-        try:
-            print(f"Đang đăng ký live trendbar cho {symbol}...")
-            live_trendbar_req = Protobuf.get('ProtoOASubscribeLiveTrendbarReq',
-                                             ctidTraderAccountId=int(CTRADER_ACCOUNT_ID),
-                                             symbolId=sid, period=period)
-            yield self.client.send(live_trendbar_req)
-            print(f"✅ Đã đăng ký live trendbar thành công cho {symbol}/{self.tf_from_period(period)}.")
-        except Exception as e:
-            print(f"Lỗi subscribe trendbar {symbol}: {e}")
-            self.history_pending.discard(key)
-            self.subscribed_trendbars.pop(key, None)
-            return
     @inlineCallbacks
     def unsubscribe(self, symbol, period):
         sid = self.symbol_ids.get(symbol)
         if not sid:
             return
 
-        # Hủy đăng ký live trendbar
-        if (sid, period) in self.subscribed_trendbars:
-            try:
-                req = Protobuf.get('ProtoOAUnsubscribeLiveTrendbarReq', ctidTraderAccountId=int(CTRADER_ACCOUNT_ID), symbolId=sid, period=period)
-                yield self.client.send(req)
-                del self.subscribed_trendbars[(sid, period)]
-                print(f"✅ Đã hủy đăng ký Live trendbar {symbol}/{self.tf_from_period(period)}")
-            except Exception as e:
-                print(f"Lỗi khi hủy đăng ký Live trendbar: {e}")
         # Dọn dẹp trạng thái lịch sử còn chờ (nếu có)
         self.history_pending.discard((sid, period))
 
@@ -459,36 +437,80 @@ class CTraderClient:
         symbol = self.get_symbol_name_by_id(payload.symbolId)
         tf = self.tf_from_period(payload.period)
         key = (payload.symbolId, payload.period)
-        
-        # Xử lý đối với dữ liệu lịch sử
+
+        # Đếm số lượng bar trong payload
+        bar_count = len(payload.trendbar)
+
         if key in self.history_pending:
-            for tb in payload.trendbar:
+            print(f"📜 {symbol}/{tf}: Nhận {bar_count} history bars")
+
+            # Build state bằng toàn bộ history trừ nến cuối
+            for tb in payload.trendbar[:-1]:
                 process_trendbar(symbol, tf, tb, live=False)
+
+            # 👉 Detect signal trên nến lịch sử gần hiện tại nhất
+            if payload.trendbar:
+                last_tb = payload.trendbar[-1]
+                process_trendbar(symbol, tf, last_tb, live=True)
+
+            # Cập nhật lại state
             self.history_pending.discard(key)
-            self.subscribed_trendbars[key] = 0
-        else:
-            count = self.subscribed_trendbars.get(key, 0)
-            if count < 1:
-                for tb in payload.trendbar:
-                    process_trendbar(symbol, tf, tb, live=False)
-                self.subscribed_trendbars[key] = count + 1
-            else:
-                for tb in payload.trendbar:
-                    process_trendbar(symbol, tf, tb, live=True)
+            self.subscribed_trendbars[key] = 1
+            return
+
+        # Nếu lần đầu subscribe -> coi như initial batch
+        if key not in self.subscribed_trendbars:
+            print(f"📊 {symbol}/{tf}: Nhận {bar_count} initial bars")
+            for tb in payload.trendbar[:-1]:
+                process_trendbar(symbol, tf, tb, live=False)
+
+            last_tb = payload.trendbar[-1]
+            process_trendbar(symbol, tf, last_tb, live=True)
+
+            self.subscribed_trendbars[key] = 1
+            return
+
+        # Ngược lại -> đây là live bars (bar lịch sử gần nhất)
+        print(f"🔴 {symbol}/{tf}: Nhận {bar_count} LIVE bars")
+        for tb in payload.trendbar[:-1]:
+            process_trendbar(symbol, tf, tb, live=False)
+
+        last_tb = payload.trendbar[-1]
+        process_trendbar(symbol, tf, last_tb, live=True)
 
 def process_trendbar(symbol, tf, tb, live=True):
     key = (symbol, tf)
     data = market_data[key]
     if tb.utcTimestampInMinutes <= data["last_ts"]:
         return
+
+    # Cập nhật counter
+    data["bar_count"] += 1
+    if live:
+        data["live_bars"] += 1
+        bar_stats[key]["live_bars"] += 1
+    else:
+        data["history_bars"] += 1  
+        bar_stats[key]["history_bars"] += 1
+
+    bar_stats[key]["total_bars"] += 1
+
+    # Cập nhật thời gian
+    if not data["first_bar_time"]:
+        data["first_bar_time"] = tb.utcTimestampInMinutes
+        bar_stats[key]["first_received"] = tb.utcTimestampInMinutes
+
+    # Process price data
     scale = 1e5
     low = tb.low / scale
     close = (tb.low + tb.deltaClose) / scale
     high = (tb.low + tb.deltaHigh) / scale
+
     data["closes"].append(close)
     data["highs"].append(high)
     data["lows"].append(low)
 
+    # Calculate indicators
     closes = list(data["closes"])
     highs = list(data["highs"])
     lows = list(data["lows"])
@@ -516,7 +538,7 @@ def process_trendbar(symbol, tf, tb, live=True):
         percentage = (total_bars / MIN_BARS_BACK * 100) if total_bars > 0 else 0
         print(f"📊 {symbol}/{tf}: {total_bars}/{MIN_BARS_BACK} ({percentage:.1f}%) - History milestone")
 
-    # Print periodic stats cho live bars (every:10 bars)  
+    # Print periodic stats cho live bars (bar lịch sử gần nhất) (every:10 bars)  
     if live and data["live_bars"] % 10 == 0:
         bar_time = datetime.fromtimestamp(tb.utcTimestampInMinutes * 60, timezone.utc)
         print(f"🔴 {symbol}/{tf}: {data['live_bars']} live bars | Latest: {bar_time.strftime('%H:%M')}")
@@ -526,7 +548,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 class TelegramBot:
     def __init__(self):
         self.offset = 0
-    
+
     def send(self, text):
         d = treq.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": CHAT_ID, "text": text})
         # Thêm hàm xử lý lỗi Telegram messenge và gắn nó vào Deferred (d)
@@ -535,13 +557,13 @@ class TelegramBot:
             return None
         d.addErrback(on_error)
         return d
-        
+
     def poll(self):
         d = treq.get(f"{TELEGRAM_API}/getUpdates", params={"timeout":0, "offset": self.offset + 1})
         d.addCallback(treq.json_content)
         d.addCallback(self._handle_updates)
         d.addErrback(lambda _: None)
-        
+
     def _handle_updates(self, data):
         for upd in data.get("result", []):
             self.offset = upd["update_id"]
@@ -550,7 +572,7 @@ class TelegramBot:
             if not text:
                 continue
             self.handle_command(text)
-            
+
     def handle_command(self, text):
         if text.startswith("/help"):
             self.send(HELP_TEXT)
@@ -563,14 +585,14 @@ class TelegramBot:
             self.send_token_status()
         elif text.startswith("/refresh"):
             ctrader.refresh_access_token()
-        elif cmd == "/bars":
+        elif text.startswith("/bars"):
             self.send_bar_stats()
-        elif cmd == "/reset_bars":
+        elif text.startswith("/reset_bars"):
             reset_bar_stats()
-            self.send_telegram("✅ Bar statistics reset")
-        elif cmd == "/print_bars":
-            print_bar_stats()
-            self.send_telegram("📊 Printed bar stats to console")
+            self.send("🔄 Bar statistics đã được reset")
+        elif text.startswith("/print_bars"):
+            print_bar_stats()  # Print ra console
+            self.send("📊 Bar statistics đã được in ra console")
         elif text.startswith("/stop"):
             stop_scanning()
             self.send("🛑 Scanning stopped")
@@ -582,14 +604,14 @@ class TelegramBot:
                 self.send("⚠️ Missing timeframe. Usage: /scan {timeframe}")
         else:
             self.send(f"Echo: {text}")
-            
+
     def send_status(self):
         if active_timeframes:
             tfs = ", ".join(sorted(active_timeframes))
             self.send(f"✅ Scanning active\nTimeframes: {tfs}\nPairs: {len(PAIRS)}")
         else:
             self.send("⚠️ Bot is idle. Use /scan to start.")
-            
+
     def send_token_status(self):
         """Gửi thông tin trạng thái token"""
         tm = ctrader.token_manager
@@ -607,7 +629,7 @@ class TelegramBot:
             status = "⚠️ Không có thông tin thời hạn token"
 
         self.send(status)
-        
+
     def send_bar_stats(self):
         """Gửi thống kê bar qua Telegram - Tổng kết ngắn gọn"""
         if not bar_stats:
@@ -641,7 +663,7 @@ class TelegramBot:
         message += "💡 /print_bars for detailed console view"
 
         self.send(message)
-        
+
 HELP_TEXT = (
 "🤖 MACD Divergence Detection Bot \n"
 "📈 Tính năng chính:\n"
@@ -707,7 +729,7 @@ def stop_scanning():
     telegram.send("🛑 Scanning stopped")
     print("\n🛑 FINAL BAR STATISTICS BEFORE STOP:")
     print_bar_stats()
-    
+
 # KHỞI ĐỘNG BOT
 def main_startup_sequence():
     """
