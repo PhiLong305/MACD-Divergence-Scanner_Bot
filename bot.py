@@ -11,6 +11,8 @@ from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOATrendbarPe
 from keep_alive import keep_alive
 from divergence import DivergenceState, detect_signals
 
+VIETNAM_timezone = timezone(timedelta(hours=7))  # UTC+7 cho Việt Nam
+
 # ================== CONFIGURATION ==================
 TELEGRAM_TOKEN = "8358892572:AAHFNZWXwwd_VIL7veQgdLBjNjI253oLCug"
 CHAT_ID = "1676202517"
@@ -72,18 +74,65 @@ market_data = defaultdict(lambda: {
     "state": DivergenceState(),
     "last_ts": 0,
     "bar_count": 0,          # Đếm tổng số bar nhận được
-    "history_bars": 0,       # Đếm bar lịch sử
-    "live_bars": 0,          # Đếm bar live
+    "history(-1)_bars": 0,   # Đếm bar lịch sử (-1)
+    "last_history_bars": 0,   # Đếm bar lịch sử gần nhất
     "first_bar_time": None,  # Thời gian bar đầu tiên
     "last_bar_time": None,   # Thời gian bar cuối cùng
 })
 active_timeframes = set()
 
+# THÊM HÀM KIỂM TRA COMPLETED BARS
+def check_completed_bar_delays():
+    """Kiểm tra xem có key nào không nhận được completed bar mới nhất"""
+    current_time = datetime.now(VIETNAM_timezone)
+    current_minutes = int(current_time.timestamp() / 60)
+
+    print(f"\n🔍 Checking completed bars at {current_time.strftime('%H:%M:%S')}")
+
+    missing_bars = []
+
+    for key, data in market_data.items():
+        if isinstance(key, tuple) and len(key) == 2:
+            symbol, tf = key
+            last_bar_time = data.get("last_bar_time", 0)
+
+            if last_bar_time == 0:
+                continue
+
+            # Lấy period của timeframe
+            period_seconds = PERIOD_SECONDS.get(TIMEFRAME_MAP.get(tf), 300)
+            period_minutes = period_seconds // 60
+
+            # Tính toán completed bar mới nhất mà bot SHOULD có
+            # Ví dụ: 17:07, period 5m -> latest completed should be 17:05
+            expected_latest = (current_minutes // period_minutes) * period_minutes
+
+            # Nếu bot's last bar cũ hơn expected latest completed bar
+            if last_bar_time < expected_latest:
+                minutes_missing = expected_latest - last_bar_time
+
+                last_bar_str = datetime.fromtimestamp(last_bar_time * 60, VIETNAM_timezone).strftime('%H:%M')
+                expected_str = datetime.fromtimestamp(expected_latest * 60, VIETNAM_timezone).strftime('%H:%M')
+
+                missing_bars.append({
+                    'key': f"{symbol}/{tf}",
+                    'last_received': last_bar_str,
+                    'should_have': expected_str,
+                    'missing_minutes': minutes_missing
+                })
+
+                print(f"❌ {symbol}/{tf}: Last={last_bar_str}, Should have={expected_str} ({minutes_missing}m missing)")
+
+    if not missing_bars:
+        print("✅ All pairs have update latest completed bars")
+
+    return missing_bars
+
 # ================== BAR COUNTER SYSTEM ==================
 bar_stats = defaultdict(lambda: {
     "total_bars": 0,
-    "history_bars": 0,
-    "live_bars": 0,
+    "history(-1)_bars": 0,
+    "last_history_bars": 0,
     "first_received": None,
     "last_received": None,
     "data_quality": "Unknown"
@@ -106,7 +155,7 @@ def print_bar_stats():
         percentage = (total / MIN_BARS_BACK * 100) if total > 0 else 0
 
         print(f"🔹 {symbol}/{tf}: {progress} ({percentage:.1f}%)")
-        print(f"   📜 History: {stats['history_bars']} | 🔴 Live: {stats['live_bars']}")
+        print(f"   📜 History(-1): {stats['history(-1)_bars']} | 🔴 Newest_history: {stats['last_history_bars']}")
 
         # Đánh giá chất lượng dựa trên tỷ lệ hoàn thành
         if percentage >= 80:
@@ -129,7 +178,7 @@ def get_bar_summary():
 
     total_symbols = len(bar_stats)
     total_bars = sum(stats['total_bars'] for stats in bar_stats.values())
-    total_live = sum(stats['live_bars'] for stats in bar_stats.values())
+    total_live = sum(stats['last_history_bars'] for stats in bar_stats.values())
 
     return f"📊 {total_symbols} symbols | {total_bars} total bars | {total_live} live bars"
 
@@ -138,8 +187,8 @@ def reset_bar_stats():
     bar_stats.clear()
     for key in market_data.keys():
         market_data[key]["bar_count"] = 0
-        market_data[key]["history_bars"] = 0
-        market_data[key]["live_bars"] = 0
+        market_data[key]["history(-1)_bars"] = 0
+        market_data[key]["last_history_bars"] = 0
         market_data[key]["first_bar_time"] = None
         market_data[key]["last_bar_time"] = None
     print("🔄 Đã reset tất cả bar statistics")
@@ -176,7 +225,7 @@ class TokenManager:
                 'access_token': self.access_token,
                 'refresh_token': self.refresh_token,
                 'expires_at': self.expires_at.isoformat() if self.expires_at else None,
-                'updated_at': datetime.now(timezone.utc).isoformat()
+                'updated_at': datetime.now(VIETNAM_timezone).isoformat()
             }
             with open(TOKEN_FILE, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -191,10 +240,10 @@ class TokenManager:
             self.refresh_token = refresh_token
 
         if expires_in_seconds:
-            self.expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)
+            self.expires_at = datetime.now(VIETNAM_timezone) + timedelta(seconds=expires_in_seconds)
         elif not self.expires_at:
             # Mặc định access token có hạn 30 ngày
-            self.expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+            self.expires_at = datetime.now(VIETNAM_timezone) + timedelta(days=30)
 
         self.save_token_info()
         self.schedule_refresh()
@@ -204,7 +253,7 @@ class TokenManager:
         if not self.expires_at:
             return False
 
-        time_until_expiry = self.expires_at - datetime.now(timezone.utc)
+        time_until_expiry = self.expires_at - datetime.now(VIETNAM_timezone)
         return time_until_expiry.total_seconds() <= (TOKEN_REFRESH_MARGIN_MINUTES * 60)
 
     def schedule_refresh(self):
@@ -215,14 +264,14 @@ class TokenManager:
         if not self.expires_at:
             return
 
-        time_until_refresh = self.expires_at - datetime.now(timezone.utc) - timedelta(minutes=TOKEN_REFRESH_MARGIN_MINUTES)
+        time_until_refresh = self.expires_at - datetime.now(VIETNAM_timezone) - timedelta(minutes=TOKEN_REFRESH_MARGIN_MINUTES)
 
         if time_until_refresh.total_seconds() > 0:
             self.refresh_task = reactor.callLater(
                 time_until_refresh.total_seconds(),
                 lambda: ctrader.refresh_access_token()
             )
-            print(f"📅 Đã lên lịch refresh token lúc: {(datetime.now(timezone.utc) + time_until_refresh).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            print(f"📅 Đã lên lịch refresh token lúc: {(datetime.now(VIETNAM_timezone) + time_until_refresh).strftime('%Y-%m-%d %H:%M:%S UTC+7')}")
         else:
             # Token sắp hết hạn, refresh ngay
             reactor.callLater(0, lambda: ctrader.refresh_access_token())
@@ -236,7 +285,6 @@ class CTraderClient:
         self.symbol_ids = {}
         self.pending = []
         self.symbols_loaded_deferred = defer.Deferred() # Thêm Deferred để quản lý việc lấy symbols
-        self.subscribed_spots = set()  # Set lưu các symbol đã subcribed spot
         self.subscribed_trendbars = {} # Dùng để theo dõi đăng ký trendbar
         self.history_pending = set()   # Set lưu trữ các key đang trong trạng thái chờ nhận dữ liệu nến lịch sử.
         self.token_manager = TokenManager()
@@ -393,18 +441,20 @@ class CTraderClient:
 
         sid = self.symbol_ids[symbol]
         key = (sid, period)
+        tf = self.tf_from_period(period)
+
         if key in self.subscribed_trendbars:
-            print(f"✅ Đã đăng ký trendbar {symbol}/{self.tf_from_period(period)}.")
+            print(f"✅ Đã đăng ký trendbar {symbol}/{tf}.")
             return
 
-        # Đánh dấu (symbolId, period) đang chờ dữ liệu lịch sử và trạng thái subcribe (0:history / 1:live)
+        # Đánh dấu (symbol,tf) đang chờ dữ liệu lịch sử và kiểm tra trạng thái subcribe
         self.history_pending.add(key)      # Add key vào set hàng chờ nhận dữ liệu lịch sử
         self.subscribed_trendbars[key] = 0
 
         # 1. Yêu cầu dữ liệu lịch sử
         try:
             print(f"Đang yêu cầu dữ liệu lịch sử cho {symbol}/{self.tf_from_period(period)}...")
-            time_now = datetime.now(timezone.utc)
+            time_now = datetime.now(VIETNAM_timezone)
             period_seconds = PERIOD_SECONDS[period]
             from_ts = int((time_now - timedelta(seconds=period_seconds * MIN_BARS_BACK)).timestamp() * 1000)
             to_ts = int(time_now.timestamp() * 1000)
@@ -487,11 +537,11 @@ def process_trendbar(symbol, tf, tb, live=True):
     # Cập nhật counter
     data["bar_count"] += 1
     if live:
-        data["live_bars"] += 1
-        bar_stats[key]["live_bars"] += 1
+        data["last_history_bars"] += 1
+        bar_stats[key]["last_history_bars"] += 1
     else:
-        data["history_bars"] += 1  
-        bar_stats[key]["history_bars"] += 1
+        data["history(-1)_bars"] += 1  
+        bar_stats[key]["history(-1)_bars"] += 1
 
     bar_stats[key]["total_bars"] += 1
 
@@ -506,7 +556,7 @@ def process_trendbar(symbol, tf, tb, live=True):
     close = (tb.low + tb.deltaClose) / scale
     high = (tb.low + tb.deltaHigh) / scale
 
-    data["closes"].append(close)
+    data["closes"].append(close) # Trượt set History để +update trendbar, -oldest_trendbar
     data["highs"].append(high)
     data["lows"].append(low)
 
@@ -520,8 +570,10 @@ def process_trendbar(symbol, tf, tb, live=True):
     macd_line = ema_fast - ema_slow
     signal = macd_line.ewm(span=MACD_SIGNAL, adjust=False).mean()
     hist = macd_line - signal
-    data["hist"].clear()
-    data["hist"].extend(hist.tolist())
+    
+    # ✨ CHỈ LẤY GIÁ TRỊ HIST CUỐI CÙNG - KHÔNG GHI ĐÈ HẾT!
+    new_hist_value = hist.iloc[-1]       # Chỉ lấy giá trị hist mới nhất
+    data["hist"].append(new_hist_value)  # Chỉ thêm 1 giá trị hist
 
     # Detect Signals
     signals = detect_signals(
@@ -531,6 +583,7 @@ def process_trendbar(symbol, tf, tb, live=True):
         for s in signals:
             telegram.send(s)
     data["last_ts"] = tb.utcTimestampInMinutes
+    data["last_bar_time"] = tb.utcTimestampInMinutes  # THÊM DÒNG NÀY
 
     # Print package milestone cho history bars (every package:1000 bars)
     total_bars = data["bar_count"]
@@ -539,9 +592,9 @@ def process_trendbar(symbol, tf, tb, live=True):
         print(f"📊 {symbol}/{tf}: {total_bars}/{MIN_BARS_BACK} ({percentage:.1f}%) - History milestone")
 
     # Print periodic stats cho live bars (bar lịch sử gần nhất) (every:10 bars)  
-    if live and data["live_bars"] % 10 == 0:
-        bar_time = datetime.fromtimestamp(tb.utcTimestampInMinutes * 60, timezone.utc)
-        print(f"🔴 {symbol}/{tf}: {data['live_bars']} live bars | Latest: {bar_time.strftime('%H:%M')}")
+    if live and data["last_history_bars"] % 10 == 0:
+        bar_time = datetime.fromtimestamp(tb.utcTimestampInMinutes * 60, VIETNAM_timezone)
+        print(f"🔴 {symbol}/{tf}: {data['last_history_bars']} New_history bars | Latest: {bar_time.strftime('%H:%M')}")
 
 # TELEGRAM BOT =============================================
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -593,6 +646,16 @@ class TelegramBot:
         elif text.startswith("/print_bars"):
             print_bar_stats()  # Print ra console
             self.send("📊 Bar statistics đã được in ra console")
+        elif text.startswith("/check"):
+            missing = check_completed_bar_delays()
+            if missing:
+                msg = f"❌ {len(missing)} pairs missing completed bars:\n"
+                for bar in missing[:8]:
+                    msg += f"🔸 {bar['key']}: missing {bar['missing_minutes']}m\n"
+                    msg += f"   Last: {bar['last_received']} | Should: {bar['should_have']}\n"
+            else:
+                msg = "✅ All pairs have latest completed bars"
+            self.send(msg)
         elif text.startswith("/stop"):
             stop_scanning()
             self.send("🛑 Scanning stopped")
@@ -616,7 +679,7 @@ class TelegramBot:
         """Gửi thông tin trạng thái token"""
         tm = ctrader.token_manager
         if tm.expires_at:
-            time_left = tm.expires_at - datetime.now(timezone.utc)
+            time_left = tm.expires_at - datetime.now(VIETNAM_timezone)
             days_left = time_left.days
             hours_left = time_left.seconds // 3600
 
@@ -681,6 +744,7 @@ HELP_TEXT = (
 "/bars - Xem thống kê bar data\n"
 "/print_bars - In chi tiết bar stats (console)\n"
 "/reset_bars - Reset bar statistics\n"
+"/missing - Kiểm tra pairs thiếu update 🆕\n"
 "/stop - Stop scanning\n"
 "/pairs - Danh sách cặp tiền theo dõi\n"
 "/scan [timeframe] - Start scanning\n"
@@ -740,7 +804,7 @@ def main_startup_sequence():
     # Gửi tin nhắn chào mừng ngay lập tức
     telegram.send(
         "🤖 MACD Divergence Bot STARTED!\n"
-        f"⏰ Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+        f"⏰ Time: {datetime.now(VIETNAM_timezone).strftime('%Y-%m-%d %H:%M:%S UTC+7')}\n"
         "📡 Data Source: IC Markets Demo\n"
         f"📈 Monitoring: {len(PAIRS)} currency pairs\n"
         f"🔧 MACD: {EMA_FAST},{EMA_SLOW},{MACD_SIGNAL}\n\n"
